@@ -164,6 +164,7 @@ import { environmentService } from "./environments.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { shouldInsertTransientFailureComment, buildTransientFailureCommentBody } from "./transient-failure-comment.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -4621,6 +4622,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "retry_exhausted" as const, queuedRun: null };
   }
 
+  async function insertTransientAdapterFailureSystemComment(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!issueId) return;
+    const postedComment = await findRunIssueComment(run.id, run.companyId, issueId);
+    if (!shouldInsertTransientFailureComment(run.livenessReason, postedComment)) return;
+    await db.insert(issueComments).values({
+      companyId: run.companyId,
+      issueId,
+      authorType: "system",
+      body: buildTransientFailureCommentBody(run.id, agent.name),
+    });
+  }
+
   async function enqueueProcessLossRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -7914,6 +7932,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
+        await insertTransientAdapterFailureSystemComment(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
         await handleRunLivenessContinuation(livenessRun);
         await handleSuccessfulRunHandoff(
@@ -8004,6 +8023,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const livenessRun = await classifyAndPersistRunLiveness(failedRun) ?? failedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
         await finalizeIssueCommentPolicy(livenessRun, agent);
+        await insertTransientAdapterFailureSystemComment(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
 
         await updateRuntimeState(agent, livenessRun, {
@@ -8067,6 +8087,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             if (failedAgent) {
               await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
               await finalizeIssueCommentPolicy(livenessRun, failedAgent).catch(() => undefined);
+              await insertTransientAdapterFailureSystemComment(livenessRun, failedAgent).catch(() => undefined);
             }
             await releaseIssueExecutionAndPromote(livenessRun).catch(() => undefined);
           }
