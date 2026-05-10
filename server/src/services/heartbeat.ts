@@ -5106,6 +5106,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       random?: () => number;
       retryReason?: string;
       wakeReason?: string;
+      allowOnClaudeLocal?: boolean;
       maxAttempts?: number;
       delayMs?: number;
     },
@@ -7889,6 +7890,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             );
           }
         }
+        let claudeUpstreamRetryScheduled = false;
         if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
           const policy = parseMaxTurnContinuationPolicy(agent);
           if (policy.enabled && policy.maxAttempts > 0) {
@@ -7911,9 +7913,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
-          await scheduleBoundedRetryForRun(livenessRun, agent);
+          if (livenessRun.errorCode === "claude_transient_upstream") {
+            const attempt = livenessRun.scheduledRetryAttempt ?? 0;
+            if (attempt < 1) {
+              const retryResult = await scheduleBoundedRetryForRun(livenessRun, agent, {
+                allowOnClaudeLocal: true,
+                maxAttempts: 1,
+                delayMs: 60_000,
+              });
+              claudeUpstreamRetryScheduled = retryResult.outcome === "scheduled";
+            }
+          } else {
+            await scheduleBoundedRetryForRun(livenessRun, agent);
+          }
         }
-        if (outcome === "failed" && livenessRun.errorCode === "claude_transient_upstream" && issueId) {
+        if (!claudeUpstreamRetryScheduled && outcome === "failed" && livenessRun.errorCode === "claude_transient_upstream" && issueId) {
           try {
             const existingComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
             if (!existingComment) {
