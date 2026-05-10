@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -151,9 +151,66 @@ describeEmbeddedPostgres("heartbeat system comment on claude_transient_upstream"
     return { companyId, agentId, issueId };
   }
 
-  it("inserts a system comment when agent posts no comment during a claude_transient_upstream run", async () => {
+  // Branch A: first failure → retry scheduled, no P1 comment
+  it("schedules a 60s retry and suppresses P1 comment on first claude_transient_upstream failure", async () => {
     const { agentId, issueId } = await seedFixture();
 
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "claude_transient_upstream",
+      errorMessage: "Claude API overloaded (transient)",
+      summary: null,
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const before = Date.now();
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    await waitFor(async () => {
+      const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
+      return runs.length > 0 && runs.every((r) => r.status !== "queued" && r.status !== "running");
+    });
+
+    // No P1 system comment on first failure
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    // A scheduled_retry run must exist with attempt=1 and ~60s delay
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun).not.toBeNull();
+    expect(retryRun?.scheduledRetryAttempt).toBe(1);
+    const dueAt = retryRun?.scheduledRetryAt?.getTime() ?? 0;
+    expect(dueAt).toBeGreaterThanOrEqual(before + 55_000);
+    expect(dueAt).toBeLessThanOrEqual(before + 65_000);
+  });
+
+  // Branch B: retry run (attempt=1) also fails → P1 system comment emitted
+  it("emits P1 system comment when the scheduled retry run also fails with claude_transient_upstream", async () => {
+    const { agentId, issueId } = await seedFixture();
+
+    // Stage 1: first failure → creates the scheduled_retry run
     mockAdapterExecute.mockResolvedValueOnce({
       exitCode: 1,
       signal: null,
@@ -178,6 +235,46 @@ describeEmbeddedPostgres("heartbeat system comment on claude_transient_upstream"
       return runs.length > 0 && runs.every((r) => r.status !== "queued" && r.status !== "running");
     });
 
+    const retryRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun).not.toBeNull();
+
+    // Stage 2: make the retry run due now and execute it (fails again)
+    const now = new Date();
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAt: new Date(now.getTime() - 1_000), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, retryRun!.id));
+
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "claude_transient_upstream",
+      errorMessage: "Claude API overloaded (transient)",
+      summary: null,
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+    });
+
+    await heartbeat.promoteDueScheduledRetries(now);
+    await heartbeat.resumeQueuedRuns();
+
+    await waitFor(async () => {
+      const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
+      return runs.length > 0 && runs.every((r) => r.status !== "queued" && r.status !== "running");
+    });
+
+    // P1 comment must be emitted after retry exhaustion
     const comments = await db
       .select()
       .from(issueComments)
@@ -194,6 +291,48 @@ describeEmbeddedPostgres("heartbeat system comment on claude_transient_upstream"
     expect(comments[0]?.body).toContain("ClaudeCoder");
   });
 
+  // Branch C: non-transient failure → no retry, no comment (existing behavior unchanged)
+  it("does not schedule a retry or insert a comment for non-transient failures", async () => {
+    const { agentId, issueId } = await seedFixture();
+
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "adapter_failed",
+      errorMessage: "Internal adapter error",
+      summary: null,
+      provider: "test",
+      model: "test-model",
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+
+    await waitFor(async () => {
+      const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
+      return runs.length > 0 && runs.every((r) => r.status !== "queued" && r.status !== "running");
+    });
+
+    const scheduledRetryRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "scheduled_retry"));
+    expect(scheduledRetryRuns).toHaveLength(0);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  // Branch D (guard): agent already posted a comment during the retry run → no system comment
   it("skips system comment when agent already posted a comment during the run", async () => {
     const { agentId, issueId, companyId } = await seedFixture();
 
