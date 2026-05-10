@@ -7913,6 +7913,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
+        if (outcome === "failed" && livenessRun.errorCode === "claude_transient_upstream" && issueId) {
+          try {
+            const existingComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
+            if (!existingComment) {
+              await issuesSvc.addComment(
+                issueId,
+                `Run ${livenessRun.id} ended with adapter_failed (claude_transient_upstream). Issue returned to todo. Assignee: ${agent.name}.`,
+                { runId: null },
+              );
+            }
+          } catch (commentErr) {
+            await onLog(
+              "stderr",
+              `[paperclip] Failed to post transient upstream system comment: ${commentErr instanceof Error ? commentErr.message : String(commentErr)}\n`,
+            );
+          }
+        }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
         await handleRunLivenessContinuation(livenessRun);
